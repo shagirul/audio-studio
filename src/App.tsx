@@ -9,7 +9,12 @@ import {
   type PresetId,
 } from "./utils/eq.ts";
 import { makeCompDefault, type CompressorState } from "./utils/compressor.ts";
-import { makeDenoiseDefault, type DenoiseState } from "./utils/denoise.ts";
+import {
+  denoiseStateFromStrength,
+  denoiseStrengthFromState,
+  makeDenoiseDefault,
+  type DenoiseState,
+} from "./utils/denoise.ts";
 import type { EffectsPayload } from "../types/electron-api";
 
 type AudioSelection = {
@@ -63,6 +68,10 @@ export default function App() {
   const [denoise, setDenoise] = useState<DenoiseState>(() =>
     makeDenoiseDefault()
   );
+  const [denoiseAdvanced, setDenoiseAdvanced] = useState(false);
+  const [denoiseStrength, setDenoiseStrength] = useState(() =>
+    denoiseStrengthFromState(makeDenoiseDefault())
+  );
 
   const [waveUrl, setWaveUrl] = useState<string | null>(null);
   const [waveBusy, setWaveBusy] = useState(false);
@@ -76,6 +85,7 @@ export default function App() {
   // Optional FFmpeg preview (for denoise, since WebAudio preview doesn't include FFmpeg filters)
   const [ffPreviewUrl, setFfPreviewUrl] = useState<string | null>(null);
   const ffPreviewElRef = useRef<HTMLAudioElement | null>(null);
+  const [applyBusy, setApplyBusy] = useState(false);
 
   const durationSeconds = useMemo(() => {
     const fmt = (audio as any)?.meta?.format;
@@ -242,25 +252,23 @@ export default function App() {
     return () => clearTimeout(t);
   }, [audio?.filePath, effects]);
 
-  const onPickFile = async () => {
-    const res = await window.api.selectAudio();
-    if (!res) return;
-    setAudio(res);
+  const loadAudioFromPath = async (
+    filePath: string,
+    meta: any,
+    options?: { resetSelection?: boolean }
+  ) => {
+    setAudio({ filePath, meta });
     setWaveUrl(null);
     lastWaveSigRef.current = "";
     setPos(0);
     setPlaying(false);
-    // Load audio bytes for browser-safe playback
-    const f = await window.api.readFileBase64({ filePath: res.filePath });
+
+    const f = await window.api.readFileBase64({ filePath });
     const bin = atob(f.dataBase64);
     const bytes = new Uint8Array(bin.length);
     for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-
     fileBytesRef.current = bytes.buffer.slice(0, bytes.byteLength);
     decodedBufRef.current = null;
-    setNoiseSampleInfo(null);
-    setDenoiseNote(null);
-    setDenoise((prev) => ({ ...prev, noiseFloorDb: -50 }));
 
     const blobUrl = URL.createObjectURL(new Blob([bytes], { type: f.mime }));
     setAudioUrl((prev) => {
@@ -268,12 +276,21 @@ export default function App() {
       return blobUrl;
     });
 
-    const d = (res as any)?.meta?.format?.duration
-      ? Number((res as any).meta.format.duration)
-      : NaN;
-    const dur = Number.isFinite(d) ? d : 0;
-    setSelStart(0);
-    setSelEnd(dur);
+    if (options?.resetSelection) {
+      const d = meta?.format?.duration ? Number(meta.format.duration) : NaN;
+      const dur = Number.isFinite(d) ? d : 0;
+      setSelStart(0);
+      setSelEnd(dur);
+    }
+  };
+
+  const onPickFile = async () => {
+    const res = await window.api.selectAudio();
+    if (!res) return;
+    await loadAudioFromPath(res.filePath, res.meta, { resetSelection: true });
+    setNoiseSampleInfo(null);
+    setDenoiseNote(null);
+    setDenoise((prev) => ({ ...prev, noiseFloorDb: -50 }));
   };
 
   const ensureDecodedBuffer = async (): Promise<AudioBuffer> => {
@@ -463,6 +480,60 @@ export default function App() {
     });
     // autoplay
     setTimeout(() => ffPreviewElRef.current?.play().catch(() => {}), 30);
+  };
+
+  const onDenoiseStrengthChange = (value: number) => {
+    setDenoiseStrength(value);
+    setDenoise((prev) => denoiseStateFromStrength(value, prev));
+  };
+
+  const updateDenoiseAdvanced = (
+    updater: (prev: DenoiseState) => DenoiseState
+  ) => {
+    setDenoise((prev) => {
+      const next = updater(prev);
+      setDenoiseStrength(denoiseStrengthFromState(next));
+      return next;
+    });
+  };
+
+  const onToggleDenoiseAdvanced = (checked: boolean) => {
+    if (checked) {
+      setDenoise((prev) => denoiseStateFromStrength(denoiseStrength, prev));
+    } else {
+      setDenoiseStrength(denoiseStrengthFromState(denoise));
+    }
+    setDenoiseAdvanced(checked);
+  };
+
+  const onApplyDenoise = async () => {
+    if (!audio) return;
+    const start = Math.min(selStart, selEnd);
+    const end = Math.max(selStart, selEnd);
+    if (end - start < 0.01) {
+      setDenoiseNote("Select a non-zero region before applying denoise.");
+      return;
+    }
+    setApplyBusy(true);
+    setDenoiseNote(null);
+    try {
+      const res = await window.api.applyDenoiseSelection({
+        inputPath: audio.filePath,
+        startSeconds: start,
+        endSeconds: end,
+        denoise: { ...denoise, outputNoiseOnly: false },
+      });
+      await loadAudioFromPath(res.filePath, res.meta, { resetSelection: false });
+      setDenoiseEnabled(false);
+      setDenoise((prev) => ({ ...prev, outputNoiseOnly: false }));
+      setDenoiseNote(
+        `Applied denoise to ${start.toFixed(2)}s–${end.toFixed(2)}s.`
+      );
+    } catch (e: any) {
+      setDenoiseNote(String(e?.message ?? e));
+    } finally {
+      setApplyBusy(false);
+    }
   };
 
   return (
@@ -655,7 +726,7 @@ export default function App() {
                 type="checkbox"
                 checked={denoise.outputNoiseOnly}
                 onChange={(e) =>
-                  setDenoise((p) => ({
+                  updateDenoiseAdvanced((p) => ({
                     ...p,
                     outputNoiseOnly: e.target.checked,
                   }))
@@ -665,40 +736,77 @@ export default function App() {
               <b>Output noise only</b>
             </label>
 
+            <label className="pill" style={{ cursor: "pointer" }}>
+              <input
+                type="checkbox"
+                checked={denoiseAdvanced}
+                onChange={(e) => onToggleDenoiseAdvanced(e.target.checked)}
+                disabled={!denoiseEnabled}
+              />
+              <b>Advanced controls</b>
+            </label>
+
             <button className="btn" onClick={onCaptureNoise} disabled={!audio}>
               Capture noise (from selection)
             </button>
             <button className="btn" onClick={onFfPreview} disabled={!audio}>
               Preview with FFmpeg (selection)
             </button>
+            <button
+              className="btn"
+              onClick={onApplyDenoise}
+              disabled={!audio || !denoiseEnabled || applyBusy}
+            >
+              {applyBusy ? "Applying…" : "Apply denoise"}
+            </button>
           </div>
         </div>
 
         <div className="row" style={{ alignItems: "flex-start" }}>
-          <Knob
-            label="Freq scale"
-            value={denoise.freqScale}
-            min={0.2}
-            max={2.0}
-            step={0.01}
-            onChange={(v) => setDenoise((p) => ({ ...p, freqScale: v }))}
-          />
-          <Knob
-            label="Smoothing"
-            value={denoise.smoothing}
-            min={0}
-            max={50}
-            step={1}
-            onChange={(v) => setDenoise((p) => ({ ...p, smoothing: v }))}
-          />
-          <Knob
-            label="Amount"
-            value={denoise.amount}
-            min={0}
-            max={40}
-            step={0.5}
-            onChange={(v) => setDenoise((p) => ({ ...p, amount: v }))}
-          />
+          {!denoiseAdvanced && (
+            <Knob
+              label="Denoise amount"
+              value={denoiseStrength}
+              min={0}
+              max={100}
+              step={1}
+              onChange={onDenoiseStrengthChange}
+            />
+          )}
+          {denoiseAdvanced && (
+            <>
+              <Knob
+                label="Freq scale"
+                value={denoise.freqScale}
+                min={0.2}
+                max={2.0}
+                step={0.01}
+                onChange={(v) =>
+                  updateDenoiseAdvanced((p) => ({ ...p, freqScale: v }))
+                }
+              />
+              <Knob
+                label="Smoothing"
+                value={denoise.smoothing}
+                min={0}
+                max={50}
+                step={1}
+                onChange={(v) =>
+                  updateDenoiseAdvanced((p) => ({ ...p, smoothing: v }))
+                }
+              />
+              <Knob
+                label="Amount"
+                value={denoise.amount}
+                min={0}
+                max={40}
+                step={0.5}
+                onChange={(v) =>
+                  updateDenoiseAdvanced((p) => ({ ...p, amount: v }))
+                }
+              />
+            </>
+          )}
 
           <div className="small" style={{ maxWidth: 640, lineHeight: 1.35 }}>
             <div>

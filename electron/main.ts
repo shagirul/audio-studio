@@ -146,6 +146,16 @@ function buildAudioFilter(effects: any, opts?: { allowMissingModel?: boolean }):
   return { chain: parts.join(','), warning };
 }
 
+function buildDenoiseFilter(denoise: any): string {
+  const d = denoise ?? {};
+  const nf = clamp(Number(d.noiseFloorDb ?? -50), -80, -20);
+  const nr = clamp(Number(d.amount ?? 12), 0.01, 97);
+  const gs = Math.round(clamp(Number(d.smoothing ?? 0), 0, 50));
+  const bm = clamp(Number(d.freqScale ?? 1.25), 0.2, 5);
+  const om = d.outputNoiseOnly ? 'noise' : 'output';
+  return `afftdn=nr=${nr.toFixed(3)}:nf=${nf.toFixed(1)}:gs=${gs}:bm=${bm.toFixed(2)}:om=${om}`;
+}
+
 ipcMain.handle('selectAudio', async () => {
   const res = await dialog.showOpenDialog({
     title: 'Choose audio',
@@ -247,5 +257,54 @@ ipcMain.handle(
     const buf = await fs.readFile(tmp);
     await fs.unlink(tmp).catch(() => {});
     return { mime: 'audio/wav', dataBase64: buf.toString('base64') };
+  }
+);
+
+ipcMain.handle(
+  'applyDenoiseSelection',
+  async (
+    _evt,
+    payload: { inputPath: string; startSeconds: number; endSeconds: number; denoise: any }
+  ) => {
+    if (!ffmpegPath) throw new Error('ffmpeg-static path missing');
+    const inputMeta = await probeAudio(payload.inputPath);
+    const rawDuration = Number(inputMeta?.format?.duration);
+    if (!Number.isFinite(rawDuration)) throw new Error('Could not determine audio duration');
+
+    const start = clamp(Number(payload.startSeconds ?? 0), 0, rawDuration);
+    const end = clamp(Number(payload.endSeconds ?? 0), 0, rawDuration);
+    if (end <= start) throw new Error('Selection range is invalid');
+
+    const outputPath = path.join(
+      app.getPath('temp'),
+      `ffeq-denoise-${Date.now()}-${Math.random().toString(16).slice(2)}.wav`
+    );
+    const denoiseFilter = buildDenoiseFilter({ ...payload.denoise, outputNoiseOnly: false });
+    const args: string[] = ['-y', '-i', payload.inputPath];
+
+    if (start <= 0 && end >= rawDuration) {
+      args.push('-af', denoiseFilter, '-c:a', 'pcm_s16le', outputPath);
+    } else {
+      const filters: string[] = [];
+      const labels: string[] = [];
+      if (start > 0) {
+        filters.push(`[0:a]atrim=0:${start.toFixed(3)},asetpts=PTS-STARTPTS[a0]`);
+        labels.push('a0');
+      }
+      filters.push(
+        `[0:a]atrim=${start.toFixed(3)}:${end.toFixed(3)},asetpts=PTS-STARTPTS,${denoiseFilter}[a1]`
+      );
+      labels.push('a1');
+      if (end < rawDuration) {
+        filters.push(`[0:a]atrim=${end.toFixed(3)},asetpts=PTS-STARTPTS[a2]`);
+        labels.push('a2');
+      }
+      filters.push(`${labels.map((l) => `[${l}]`).join('')}concat=n=${labels.length}:v=0:a=1[outa]`);
+      args.push('-filter_complex', filters.join(';'), '-map', '[outa]', '-c:a', 'pcm_s16le', outputPath);
+    }
+
+    await runProcess(ffmpegPath, args);
+    const outputMeta = await probeAudio(outputPath);
+    return { filePath: outputPath, meta: outputMeta };
   }
 );

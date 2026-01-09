@@ -53,6 +53,7 @@ declare global {
       exportAudio: (payload: { inputPath: string; outputPath: string; effects: EffectsPayload; range?: { startSeconds: number; endSeconds: number } }) => Promise<void>;
       renderWaveform: (payload: { inputPath: string; width?: number; height?: number; effects?: EffectsPayload }) => Promise<{ mime: 'image/png'; dataBase64: string }>;
       renderPreview: (payload: { inputPath: string; effects: EffectsPayload; startSeconds: number; durationSeconds: number }) => Promise<{ mime: string; dataBase64: string }>;
+      applyDenoiseSelection: (payload: { inputPath: string; startSeconds: number; endSeconds: number; denoise: DenoiseState }) => Promise<{ filePath: string; meta: any }>;
     };
   }
 }
