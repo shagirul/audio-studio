@@ -89,22 +89,9 @@ function clamp(v: number, min: number, max: number) {
   return Math.max(min, Math.min(max, v));
 }
 
-function buildAudioFilter(effects: any, opts?: { allowMissingModel?: boolean }): { chain: string; warning?: string } {
+function buildEqCompLimiterFilter(effects: any): string {
   const parts: string[] = [];
-  let warning: string | undefined;
 
-  // DENOISE (sample-calibrated FFT denoise via afftdn) - before EQ + compressor
-  if (effects?.denoiseEnabled) {
-    const d = effects?.denoise ?? {};
-    const nf = clamp(Number(d.noiseFloorDb ?? -50), -80, -20);
-    const nr = clamp(Number(d.amount ?? 12), 0.01, 97);
-    const gs = Math.round(clamp(Number(d.smoothing ?? 0), 0, 50));
-    const bm = clamp(Number(d.freqScale ?? 1.25), 0.2, 5);
-    const om = d.outputNoiseOnly ? 'noise' : 'output';
-    parts.push(`afftdn=nr=${nr.toFixed(3)}:nf=${nf.toFixed(1)}:gs=${gs}:bm=${bm.toFixed(2)}:om=${om}`);
-  }
-
-  // EQ
   if (effects?.eqEnabled) {
     const eq = effects.eq;
     const preampDb = Number(eq?.preampDb ?? 0);
@@ -119,7 +106,6 @@ function buildAudioFilter(effects: any, opts?: { allowMissingModel?: boolean }):
     }
   }
 
-  // COMPRESSOR
   if (effects?.compEnabled) {
     const c = effects.comp || {};
     const thresholdDb = Number(c.thresholdDb ?? -24);
@@ -138,12 +124,57 @@ function buildAudioFilter(effects: any, opts?: { allowMissingModel?: boolean }):
     );
   }
 
-  // LIMITER (last)
   if (effects?.eq?.limiter) {
     parts.push('alimiter=limit=0.98');
   }
 
-  return { chain: parts.join(','), warning };
+  return parts.join(',');
+}
+
+function buildDeEsserComplex(denoiseInput: string, deEsser: any) {
+  const d = deEsser ?? {};
+  const freq = clamp(Number(d.frequencyHz ?? 6500), 4000, 10000);
+  const width = clamp(freq * 0.6, 2000, 6000);
+  const thresholdDb = clamp(Number(d.thresholdDb ?? -24), -60, -6);
+  const ratio = clamp(Number(d.ratio ?? 3), 1, 12);
+  const attackSec = clamp(Number(d.attackMs ?? 4), 0.1, 50) / 1000;
+  const releaseSec = clamp(Number(d.releaseMs ?? 80), 10, 500) / 1000;
+
+  const filters = [
+    `[${denoiseInput}]asplit=2[sib][rest]`,
+    `[sib]bandpass=f=${freq.toFixed(0)}:w=${width.toFixed(0)}:width_type=h[sibband]`,
+    `[sibband][sibband]sidechaincompress=threshold=${thresholdDb.toFixed(1)}:ratio=${ratio.toFixed(
+      2
+    )}:attack=${attackSec.toFixed(3)}:release=${releaseSec.toFixed(3)}[sibcomp]`,
+    `[rest]bandreject=f=${freq.toFixed(0)}:w=${width.toFixed(0)}:width_type=h[restband]`,
+    `[restband][sibcomp]amix=inputs=2:normalize=0[deout]`
+  ];
+
+  return { filter: filters.join(';'), outputLabel: 'deout' };
+}
+
+function buildEffectsFilterComplex(effects: any) {
+  const denoiseFilter = effects?.denoiseEnabled ? buildDenoiseFilter(effects?.denoise ?? {}) : '';
+  const postFilter = buildEqCompLimiterFilter(effects);
+
+  if (!effects?.deEsserEnabled) {
+    return { filter: [denoiseFilter, postFilter].filter(Boolean).join(','), usesComplex: false, outputLabel: '' };
+  }
+
+  const filters: string[] = [];
+  let inputLabel = '0:a';
+  if (denoiseFilter) {
+    filters.push(`[0:a]${denoiseFilter}[denoise]`);
+    inputLabel = 'denoise';
+  }
+  const de = buildDeEsserComplex(inputLabel, effects?.deEsser ?? {});
+  filters.push(de.filter);
+  let outputLabel = de.outputLabel;
+  if (postFilter) {
+    filters.push(`[${outputLabel}]${postFilter}[outa]`);
+    outputLabel = 'outa';
+  }
+  return { filter: filters.join(';'), usesComplex: true, outputLabel };
 }
 
 function buildDenoiseFilter(denoise: any): string {
@@ -190,7 +221,7 @@ ipcMain.handle(
     payload: { inputPath: string; outputPath: string; effects: any; range?: { startSeconds: number; endSeconds: number } }
   ) => {
     if (!ffmpegPath) throw new Error('ffmpeg-static path missing');
-    const { chain } = buildAudioFilter(payload.effects);
+    const { filter, usesComplex, outputLabel } = buildEffectsFilterComplex(payload.effects);
 
     const args: string[] = ['-y'];
     const start = payload.range?.startSeconds;
@@ -199,7 +230,13 @@ ipcMain.handle(
       args.push('-ss', String(start.toFixed(3)), '-t', String((end - start).toFixed(3)));
     }
     args.push('-i', payload.inputPath);
-    if (chain) args.push('-af', chain);
+    if (filter) {
+      if (usesComplex) {
+        args.push('-filter_complex', filter, '-map', `[${outputLabel}]`);
+      } else {
+        args.push('-af', filter);
+      }
+    }
 
     const ext = path.extname(payload.outputPath).toLowerCase();
     if (ext === '.wav') {
@@ -220,12 +257,15 @@ ipcMain.handle(
     const h = payload.height ?? 220;
     const tmp = path.join(app.getPath('temp'), `ffeq-wave-${Date.now()}-${Math.random().toString(16).slice(2)}.png`);
 
-    const { chain } = buildAudioFilter(payload.effects ?? {}, { allowMissingModel: true });
-    const fullChain = [chain, 'aformat=channel_layouts=mono', 'aresample=8000', `showwavespic=s=${w}x${h}:colors=white`]
-      .filter(Boolean)
-      .join(',');
+    const { filter, usesComplex, outputLabel } = buildEffectsFilterComplex(payload.effects ?? {});
+    const tail = 'aformat=channel_layouts=mono,aresample=8000,showwavespic=s=' + w + 'x' + h + ':colors=white';
+    const fullChain = usesComplex
+      ? [filter, `[${outputLabel}]${tail}[outv]`].filter(Boolean).join(';')
+      : [filter, tail].filter(Boolean).join(',');
 
-    const args = ['-y', '-i', payload.inputPath, '-filter_complex', fullChain, '-frames:v', '1', tmp];
+    const args = ['-y', '-i', payload.inputPath, '-filter_complex', fullChain];
+    if (usesComplex) args.push('-map', '[outv]');
+    args.push('-frames:v', '1', tmp);
     await runProcess(ffmpegPath, args);
     const buf = await fs.readFile(tmp);
     await fs.unlink(tmp).catch(() => {});
@@ -240,7 +280,7 @@ ipcMain.handle(
     payload: { inputPath: string; effects: any; startSeconds: number; durationSeconds: number }
   ) => {
     if (!ffmpegPath) throw new Error('ffmpeg-static path missing');
-    const { chain } = buildAudioFilter(payload.effects);
+    const { filter, usesComplex, outputLabel } = buildEffectsFilterComplex(payload.effects);
     const tmp = path.join(app.getPath('temp'), `ffeq-prev-${Date.now()}-${Math.random().toString(16).slice(2)}.wav`);
     const args: string[] = [
       '-y',
@@ -251,7 +291,13 @@ ipcMain.handle(
       '-i',
       payload.inputPath
     ];
-    if (chain) args.push('-af', chain);
+    if (filter) {
+      if (usesComplex) {
+        args.push('-filter_complex', filter, '-map', `[${outputLabel}]`);
+      } else {
+        args.push('-af', filter);
+      }
+    }
     args.push('-c:a', 'pcm_s16le', tmp);
     await runProcess(ffmpegPath, args);
     const buf = await fs.readFile(tmp);

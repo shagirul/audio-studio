@@ -1,20 +1,29 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { Knob } from "./components/Knob";
 import { Waveform } from "./components/Waveform";
+import { BAND_FREQS, PRESETS, type EqState, type PresetId } from "./utils/eq.ts";
 import {
-  BAND_FREQS,
-  makeFlat,
-  PRESETS,
-  type EqState,
-  type PresetId,
-} from "./utils/eq.ts";
-import { makeCompDefault, type CompressorState } from "./utils/compressor.ts";
+  COMP_PRESETS,
+  type CompressorPresetId,
+  type CompressorState,
+} from "./utils/compressor.ts";
 import {
   denoiseStateFromStrength,
   denoiseStrengthFromState,
   makeDenoiseDefault,
   type DenoiseState,
 } from "./utils/denoise.ts";
+import {
+  DE_ESSER_PRESETS,
+  deEsserAmountFromState,
+  deEsserFromAmount,
+  type DeEsserPresetId,
+  type DeEsserState,
+} from "./utils/deesser.ts";
+import {
+  CHAIN_PRESETS,
+  type ChainPresetId,
+} from "./utils/chainPresets.ts";
 import type { EffectsPayload } from "../types/electron-api";
 
 type AudioSelection = {
@@ -43,6 +52,12 @@ function dbToGain(db: number) {
   return Math.pow(10, db / 20);
 }
 
+function computeAutoMakeup(thresholdDb: number, ratio: number) {
+  const drive = Math.max(0, -thresholdDb / 18);
+  const ratioFactor = Math.max(1, ratio) - 1;
+  return clamp(drive * ratioFactor * 1.4, 0, 8);
+}
+
 export default function App() {
   const [audio, setAudio] = useState<AudioSelection>(null);
   const [audioUrl, setAudioUrl] = useState<string | null>(null);
@@ -58,11 +73,16 @@ export default function App() {
   const [denoiseNote, setDenoiseNote] = useState<string | null>(null);
 
   const [eqEnabled, setEqEnabled] = useState(true);
-  const [eq, setEq] = useState<EqState>(() => makeFlat());
-  const [preset, setPreset] = useState<PresetId>("flat");
+  const [eq, setEq] = useState<EqState>(() => PRESETS.podcastClean.state);
+  const [preset, setPreset] = useState<PresetId>("podcastClean");
 
   const [compEnabled, setCompEnabled] = useState(true);
-  const [comp, setComp] = useState<CompressorState>(() => makeCompDefault());
+  const [compPreset, setCompPreset] =
+    useState<CompressorPresetId>("podcastLeveler");
+  const [comp, setComp] = useState<CompressorState>(
+    () => COMP_PRESETS.podcastLeveler.state
+  );
+  const [compAutoMakeup, setCompAutoMakeup] = useState(false);
 
   const [denoiseEnabled, setDenoiseEnabled] = useState(false);
   const [denoise, setDenoise] = useState<DenoiseState>(() =>
@@ -72,6 +92,20 @@ export default function App() {
   const [denoiseStrength, setDenoiseStrength] = useState(() =>
     denoiseStrengthFromState(makeDenoiseDefault())
   );
+
+  const [deEsserEnabled, setDeEsserEnabled] = useState(true);
+  const [deEsserPreset, setDeEsserPreset] =
+    useState<DeEsserPresetId>("medium");
+  const [deEsser, setDeEsser] = useState<DeEsserState>(
+    () => DE_ESSER_PRESETS.medium.state
+  );
+  const [deEsserAdvanced, setDeEsserAdvanced] = useState(false);
+  const [deEsserStrength, setDeEsserStrength] = useState(() =>
+    deEsserAmountFromState(DE_ESSER_PRESETS.medium.state)
+  );
+
+  const [chainPreset, setChainPreset] =
+    useState<ChainPresetId>("podcastStandard");
 
   const [waveUrl, setWaveUrl] = useState<string | null>(null);
   const [waveBusy, setWaveBusy] = useState(false);
@@ -100,21 +134,37 @@ export default function App() {
     () => ({
       denoiseEnabled,
       denoise,
+      deEsserEnabled,
+      deEsser,
       eqEnabled,
       eq,
       compEnabled,
       comp,
     }),
-    [denoiseEnabled, denoise, eqEnabled, eq, compEnabled, comp]
+    [
+      denoiseEnabled,
+      denoise,
+      deEsserEnabled,
+      deEsser,
+      eqEnabled,
+      eq,
+      compEnabled,
+      comp,
+    ]
   );
 
   // --- WebAudio graph (EQ + compressor only) ---
   const ctxRef = useRef<AudioContext | null>(null);
   const srcNodeRef = useRef<MediaElementAudioSourceNode | null>(null);
   const preampRef = useRef<GainNode | null>(null);
+  const deEsserBandpassRef = useRef<BiquadFilterNode | null>(null);
+  const deEsserNotchRef = useRef<BiquadFilterNode | null>(null);
+  const deEsserCompRef = useRef<DynamicsCompressorNode | null>(null);
+  const deEsserMixRef = useRef<GainNode | null>(null);
   const eqNodesRef = useRef<BiquadFilterNode[]>([]);
   const compNodeRef = useRef<DynamicsCompressorNode | null>(null);
   const makeupRef = useRef<GainNode | null>(null);
+  const [compReductionDb, setCompReductionDb] = useState(0);
 
   const ensureAudioGraph = () => {
     if (!audioElRef.current) return;
@@ -124,6 +174,14 @@ export default function App() {
         audioElRef.current
       );
       preampRef.current = ctxRef.current.createGain();
+
+      deEsserBandpassRef.current = ctxRef.current.createBiquadFilter();
+      deEsserBandpassRef.current.type = "bandpass";
+      deEsserNotchRef.current = ctxRef.current.createBiquadFilter();
+      deEsserNotchRef.current.type = "notch";
+      deEsserCompRef.current = ctxRef.current.createDynamicsCompressor();
+      deEsserMixRef.current = ctxRef.current.createGain();
+      deEsserMixRef.current.gain.value = 1;
 
       eqNodesRef.current = BAND_FREQS.map((f) => {
         const n = ctxRef.current!.createBiquadFilter();
@@ -146,15 +204,23 @@ export default function App() {
     const ctx = ctxRef.current;
     const src = srcNodeRef.current;
     const pre = preampRef.current;
+    const deBand = deEsserBandpassRef.current;
+    const deNotch = deEsserNotchRef.current;
+    const deComp = deEsserCompRef.current;
+    const deMix = deEsserMixRef.current;
     const eqs = eqNodesRef.current;
     const compN = compNodeRef.current;
     const makeup = makeupRef.current;
-    if (!ctx || !src || !pre || !compN || !makeup) return;
+    if (!ctx || !src || !pre || !compN || !makeup || !deBand || !deNotch || !deComp || !deMix) return;
 
     // Disconnect everything first.
     try {
       src.disconnect();
       pre.disconnect();
+      deBand.disconnect();
+      deNotch.disconnect();
+      deComp.disconnect();
+      deMix.disconnect();
       eqs.forEach((n) => n.disconnect());
       compN.disconnect();
       makeup.disconnect();
@@ -164,6 +230,17 @@ export default function App() {
     let head: AudioNode = src;
     head.connect(pre);
     head = pre;
+
+    if (deEsserEnabled) {
+      pre.connect(deBand);
+      deBand.connect(deComp);
+      deComp.connect(deMix);
+
+      pre.connect(deNotch);
+      deNotch.connect(deMix);
+
+      head = deMix;
+    }
 
     if (eqEnabled) {
       // chain through eq filters
@@ -206,6 +283,23 @@ export default function App() {
     makeup.gain.value = compEnabled ? dbToGain(comp.makeupDb) : 1;
   };
 
+  const updateDeEsserParams = () => {
+    const band = deEsserBandpassRef.current;
+    const notch = deEsserNotchRef.current;
+    const compNode = deEsserCompRef.current;
+    if (!band || !notch || !compNode) return;
+    const freq = clamp(deEsser.frequencyHz, 4000, 10000);
+    band.frequency.value = freq;
+    notch.frequency.value = freq;
+    band.Q.value = 1;
+    notch.Q.value = 1;
+    compNode.threshold.value = deEsser.thresholdDb;
+    compNode.ratio.value = deEsser.ratio;
+    compNode.attack.value = deEsser.attackMs / 1000;
+    compNode.release.value = deEsser.releaseMs / 1000;
+    compNode.knee.value = 2;
+  };
+
   useEffect(() => {
     updateEqParams();
     reconnectGraph();
@@ -217,6 +311,31 @@ export default function App() {
     reconnectGraph();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [comp, compEnabled]);
+
+  useEffect(() => {
+    updateDeEsserParams();
+    reconnectGraph();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [deEsser, deEsserEnabled]);
+
+  useEffect(() => {
+    if (!compAutoMakeup) return;
+    const auto = computeAutoMakeup(comp.thresholdDb, comp.ratio);
+    if (Math.abs(auto - comp.makeupDb) < 0.1) return;
+    setComp((prev) => ({ ...prev, makeupDb: auto }));
+  }, [compAutoMakeup, comp.thresholdDb, comp.ratio, comp.makeupDb]);
+
+  useEffect(() => {
+    let raf = 0;
+    const update = () => {
+      if (compNodeRef.current) {
+        setCompReductionDb(compNodeRef.current.reduction);
+      }
+      raf = requestAnimationFrame(update);
+    };
+    raf = requestAnimationFrame(update);
+    return () => cancelAnimationFrame(raf);
+  }, []);
 
   // --- Waveform regeneration (FFmpeg, debounced) ---
   useEffect(() => {
@@ -341,6 +460,13 @@ export default function App() {
       limiter: next.limiter,
       bands: next.bands.map((b) => ({ ...b })),
     });
+  };
+
+  const onCompPresetChange = (id: CompressorPresetId) => {
+    setCompPreset(id);
+    const next = COMP_PRESETS[id].state;
+    setComp({ ...next });
+    setCompAutoMakeup(false);
   };
 
   const setBandGain = (freq: number, gainDb: number) => {
@@ -482,6 +608,33 @@ export default function App() {
     setTimeout(() => ffPreviewElRef.current?.play().catch(() => {}), 30);
   };
 
+  const onChainPresetChange = (id: ChainPresetId) => {
+    setChainPreset(id);
+    const chain = CHAIN_PRESETS[id];
+    const eqPreset = PRESETS[chain.eqPreset];
+    const compPreset = COMP_PRESETS[chain.compPreset];
+    const deEsserPreset = DE_ESSER_PRESETS[chain.deEsserPreset];
+
+    setPreset(chain.eqPreset);
+    setEq({
+      preampDb: eqPreset.state.preampDb,
+      limiter: chain.limiterEnabled,
+      bands: eqPreset.state.bands.map((b) => ({ ...b })),
+    });
+    setEqEnabled(true);
+
+    setCompPreset(chain.compPreset);
+    setComp({ ...compPreset.state });
+    setCompEnabled(true);
+    setCompAutoMakeup(false);
+
+    setDeEsserPreset(chain.deEsserPreset);
+    setDeEsser({ ...deEsserPreset.state });
+    setDeEsserStrength(deEsserAmountFromState(deEsserPreset.state));
+    setDeEsserEnabled(true);
+    setDeEsserAdvanced(false);
+  };
+
   const onDenoiseStrengthChange = (value: number) => {
     setDenoiseStrength(value);
     setDenoise((prev) => denoiseStateFromStrength(value, prev));
@@ -504,6 +657,37 @@ export default function App() {
       setDenoiseStrength(denoiseStrengthFromState(denoise));
     }
     setDenoiseAdvanced(checked);
+  };
+
+  const onDeEsserStrengthChange = (value: number) => {
+    setDeEsserStrength(value);
+    setDeEsser((prev) => deEsserFromAmount(value, prev));
+  };
+
+  const updateDeEsserAdvanced = (
+    updater: (prev: DeEsserState) => DeEsserState
+  ) => {
+    setDeEsser((prev) => {
+      const next = updater(prev);
+      setDeEsserStrength(deEsserAmountFromState(next));
+      return next;
+    });
+  };
+
+  const onToggleDeEsserAdvanced = (checked: boolean) => {
+    if (checked) {
+      setDeEsser((prev) => deEsserFromAmount(deEsserStrength, prev));
+    } else {
+      setDeEsserStrength(deEsserAmountFromState(deEsser));
+    }
+    setDeEsserAdvanced(checked);
+  };
+
+  const onDeEsserPresetChange = (id: DeEsserPresetId) => {
+    setDeEsserPreset(id);
+    const next = DE_ESSER_PRESETS[id].state;
+    setDeEsser({ ...next });
+    setDeEsserStrength(deEsserAmountFromState(next));
   };
 
   const onApplyDenoise = async () => {
@@ -551,7 +735,10 @@ export default function App() {
           <button className="btn" onClick={onPickFile}>
             Choose audio…
           </button>
-          <button className="btn" onClick={() => onPresetChange("flat")}>
+          <button
+            className="btn"
+            onClick={() => onPresetChange("podcastClean")}
+          >
             Reset EQ
           </button>
           <button className="btn" onClick={onExport} disabled={!audio}>
@@ -707,6 +894,36 @@ export default function App() {
 
         <div className="hr" />
 
+        {/* VOCAL CHAIN PRESETS */}
+        <div className="row" style={{ justifyContent: "space-between" }}>
+          <div className="sectionTitle">VOCAL CHAIN PRESETS</div>
+          <div className="pill">
+            <span className="small">Preset</span>
+            <select
+              value={chainPreset}
+              onChange={(e) =>
+                onChainPresetChange(e.target.value as ChainPresetId)
+              }
+            >
+              {Object.entries(CHAIN_PRESETS).map(([id, p]) => (
+                <option key={id} value={id}>
+                  {p.name}
+                </option>
+              ))}
+            </select>
+          </div>
+        </div>
+        <div className="small" style={{ marginTop: 8, maxWidth: 720 }}>
+          <div>
+            <b>What it&apos;s good for:</b> {CHAIN_PRESETS[chainPreset].description}
+          </div>
+          <div style={{ marginTop: 4 }}>
+            <b>Use when:</b> {CHAIN_PRESETS[chainPreset].useWhen}
+          </div>
+        </div>
+
+        <div className="hr" />
+
         {/* DENOISE */}
         <div className="row" style={{ justifyContent: "space-between" }}>
           <div className="sectionTitle">CLEAN UP (DENOISE)</div>
@@ -755,9 +972,9 @@ export default function App() {
             <button
               className="btn"
               onClick={onApplyDenoise}
-              disabled={!audio || !denoiseEnabled || applyBusy}
+              disabled={!audio || applyBusy}
             >
-              {applyBusy ? "Applying…" : "Apply denoise"}
+              {applyBusy ? "Finalizing…" : "Finalize denoise"}
             </button>
           </div>
         </div>
@@ -856,6 +1073,136 @@ export default function App() {
 
         <div className="hr" />
 
+        {/* DE-ESSER */}
+        <div className="row" style={{ justifyContent: "space-between" }}>
+          <div className="sectionTitle">DE-ESSER</div>
+          <div className="row">
+            <label className="pill" style={{ cursor: "pointer" }}>
+              <input
+                type="checkbox"
+                checked={deEsserEnabled}
+                onChange={(e) => setDeEsserEnabled(e.target.checked)}
+              />
+              <b>On</b>
+            </label>
+            <label className="pill" style={{ cursor: "pointer" }}>
+              <input
+                type="checkbox"
+                checked={deEsserAdvanced}
+                onChange={(e) => onToggleDeEsserAdvanced(e.target.checked)}
+                disabled={!deEsserEnabled}
+              />
+              <b>Advanced controls</b>
+            </label>
+            <div className="pill">
+              <span className="small">Preset</span>
+              <select
+                value={deEsserPreset}
+                onChange={(e) =>
+                  onDeEsserPresetChange(e.target.value as DeEsserPresetId)
+                }
+                disabled={!deEsserEnabled}
+              >
+                {Object.entries(DE_ESSER_PRESETS).map(([id, p]) => (
+                  <option key={id} value={id}>
+                    {p.name}
+                  </option>
+                ))}
+              </select>
+            </div>
+          </div>
+        </div>
+
+        <div className="row" style={{ alignItems: "flex-start" }}>
+          {!deEsserAdvanced && (
+            <Knob
+              label="De-ess amount"
+              value={deEsserStrength}
+              min={0}
+              max={100}
+              step={1}
+              onChange={onDeEsserStrengthChange}
+              disabled={!deEsserEnabled}
+            />
+          )}
+          {deEsserAdvanced && (
+            <>
+              <Knob
+                label="Frequency"
+                value={deEsser.frequencyHz}
+                min={4000}
+                max={10000}
+                step={100}
+                unit=" Hz"
+                onChange={(v) =>
+                  updateDeEsserAdvanced((p) => ({ ...p, frequencyHz: v }))
+                }
+                disabled={!deEsserEnabled}
+              />
+              <Knob
+                label="Threshold"
+                value={deEsser.thresholdDb}
+                min={-60}
+                max={-6}
+                step={1}
+                unit=" dB"
+                onChange={(v) =>
+                  updateDeEsserAdvanced((p) => ({ ...p, thresholdDb: v }))
+                }
+                disabled={!deEsserEnabled}
+              />
+              <Knob
+                label="Ratio"
+                value={deEsser.ratio}
+                min={1}
+                max={10}
+                step={0.1}
+                unit=":1"
+                onChange={(v) =>
+                  updateDeEsserAdvanced((p) => ({ ...p, ratio: v }))
+                }
+                disabled={!deEsserEnabled}
+              />
+              <Knob
+                label="Attack"
+                value={deEsser.attackMs}
+                min={0.1}
+                max={20}
+                step={0.1}
+                unit=" ms"
+                onChange={(v) =>
+                  updateDeEsserAdvanced((p) => ({ ...p, attackMs: v }))
+                }
+                disabled={!deEsserEnabled}
+              />
+              <Knob
+                label="Release"
+                value={deEsser.releaseMs}
+                min={20}
+                max={200}
+                step={1}
+                unit=" ms"
+                onChange={(v) =>
+                  updateDeEsserAdvanced((p) => ({ ...p, releaseMs: v }))
+                }
+                disabled={!deEsserEnabled}
+              />
+            </>
+          )}
+          <div className="small" style={{ maxWidth: 640, lineHeight: 1.35 }}>
+            <div>
+              <b>What this does:</b>{" "}
+              {DE_ESSER_PRESETS[deEsserPreset].description}
+            </div>
+            <div style={{ marginTop: 8, opacity: 0.85 }}>
+              Targets harsh S/SH/T consonants dynamically without dulling the
+              whole voice.
+            </div>
+          </div>
+        </div>
+
+        <div className="hr" />
+
         {/* EQ */}
         <div className="row" style={{ justifyContent: "space-between" }}>
           <div className="sectionTitle">EQUALIZER</div>
@@ -893,6 +1240,9 @@ export default function App() {
             </div>
           </div>
         </div>
+        <div className="small" style={{ marginTop: 6, maxWidth: 720 }}>
+          <b>What this does:</b> {PRESETS[preset].description}
+        </div>
 
         <div className="row">
           <Knob
@@ -926,14 +1276,77 @@ export default function App() {
         {/* COMP */}
         <div className="row" style={{ justifyContent: "space-between" }}>
           <div className="sectionTitle">COMPRESSOR</div>
-          <label className="pill" style={{ cursor: "pointer" }}>
-            <input
-              type="checkbox"
-              checked={compEnabled}
-              onChange={(e) => setCompEnabled(e.target.checked)}
+          <div className="row">
+            <label className="pill" style={{ cursor: "pointer" }}>
+              <input
+                type="checkbox"
+                checked={compEnabled}
+                onChange={(e) => setCompEnabled(e.target.checked)}
+              />
+              <b>On</b>
+            </label>
+            <label className="pill" style={{ cursor: "pointer" }}>
+              <input
+                type="checkbox"
+                checked={compAutoMakeup}
+                onChange={(e) => setCompAutoMakeup(e.target.checked)}
+              />
+              <b>Auto makeup</b>
+            </label>
+            <div className="pill">
+              <span className="small">Preset</span>
+              <select
+                value={compPreset}
+                onChange={(e) =>
+                  onCompPresetChange(e.target.value as CompressorPresetId)
+                }
+              >
+                {Object.entries(COMP_PRESETS).map(([id, p]) => (
+                  <option key={id} value={id}>
+                    {p.name}
+                  </option>
+                ))}
+              </select>
+            </div>
+          </div>
+        </div>
+
+        <div className="small" style={{ marginTop: 6, maxWidth: 720 }}>
+          <b>What this does:</b> {COMP_PRESETS[compPreset].description}
+        </div>
+
+        <div
+          style={{
+            marginTop: 10,
+            display: "flex",
+            alignItems: "center",
+            gap: 12,
+          }}
+        >
+          <div className="small" style={{ minWidth: 120 }}>
+            Gain reduction
+          </div>
+          <div
+            style={{
+              flex: 1,
+              height: 10,
+              borderRadius: 999,
+              background: "rgba(255,255,255,0.08)",
+              overflow: "hidden",
+            }}
+          >
+            <div
+              style={{
+                height: "100%",
+                width: `${Math.min(100, Math.max(0, (-compReductionDb / 20) * 100))}%`,
+                background: "linear-gradient(90deg, #5eead4, #60a5fa)",
+                transition: "width 0.1s linear",
+              }}
             />
-            <b>On</b>
-          </label>
+          </div>
+          <div className="small" style={{ minWidth: 60, textAlign: "right" }}>
+            {compReductionDb.toFixed(1)} dB
+          </div>
         </div>
 
         <div className="row" style={{ gap: 18, marginTop: 2 }}>
@@ -990,6 +1403,7 @@ export default function App() {
             step={0.5}
             unit=" dB"
             onChange={(v) => setComp((p) => ({ ...p, makeupDb: v }))}
+            disabled={compAutoMakeup}
           />
         </div>
       </div>

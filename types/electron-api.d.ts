@@ -15,6 +15,15 @@ export type CompressorState = {
   makeupDb: number;
 };
 
+export type DeEsserState = {
+  amount: number;
+  frequencyHz: number;
+  thresholdDb: number;
+  ratio: number;
+  attackMs: number;
+  releaseMs: number;
+};
+
 export type DenoiseState = {
   /**
    * Sampled noise floor in dBFS (FFmpeg afftdn expects -80..-20).
@@ -38,6 +47,8 @@ export type DenoiseState = {
 export type EffectsPayload = {
   denoiseEnabled: boolean;
   denoise: DenoiseState;
+  deEsserEnabled: boolean;
+  deEsser: DeEsserState;
   eqEnabled: boolean;
   eq: EqState;
   compEnabled: boolean;
