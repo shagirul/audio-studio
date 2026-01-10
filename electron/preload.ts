@@ -6,5 +6,6 @@ contextBridge.exposeInMainWorld('api', {
   chooseExportPath: (payload: { defaultName: string }) => ipcRenderer.invoke('chooseExportPath', payload),
   exportAudio: (payload: any) => ipcRenderer.invoke('exportAudio', payload),
   renderWaveform: (payload: any) => ipcRenderer.invoke('renderWaveform', payload),
-  renderPreview: (payload: any) => ipcRenderer.invoke('renderPreview', payload)
+  renderPreview: (payload: any) => ipcRenderer.invoke('renderPreview', payload),
+  applyDenoiseSelection: (payload: any) => ipcRenderer.invoke('applyDenoiseSelection', payload)
 });

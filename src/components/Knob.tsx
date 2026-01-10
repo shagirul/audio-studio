@@ -8,13 +8,23 @@ type Props = {
   step?: number;
   unit?: string;
   onChange: (v: number) => void;
+  disabled?: boolean;
 };
 
 function clamp(v: number, min: number, max: number) {
   return Math.max(min, Math.min(max, v));
 }
 
-export function Knob({ label, value, min, max, step = 0.1, unit = '', onChange }: Props) {
+export function Knob({
+  label,
+  value,
+  min,
+  max,
+  step = 0.1,
+  unit = '',
+  onChange,
+  disabled = false
+}: Props) {
   const ref = useRef<HTMLDivElement | null>(null);
   const startRef = useRef({ y: 0, val: 0 });
 
@@ -28,11 +38,13 @@ export function Knob({ label, value, min, max, step = 0.1, unit = '', onChange }
   }, [value, unit, step]);
 
   const onPointerDown = (e: React.PointerEvent) => {
+    if (disabled) return;
     ref.current?.setPointerCapture(e.pointerId);
     startRef.current = { y: e.clientY, val: value };
   };
 
   const onPointerMove = (e: React.PointerEvent) => {
+    if (disabled) return;
     if (!(e.buttons & 1)) return;
     const dy = startRef.current.y - e.clientY;
     const sensitivity = (max - min) / 160;
@@ -44,7 +56,7 @@ export function Knob({ label, value, min, max, step = 0.1, unit = '', onChange }
   return (
     <div className="knobWrap">
       <div
-        className="knob"
+        className={`knob${disabled ? ' knobDisabled' : ''}`}
         ref={ref}
         onPointerDown={onPointerDown}
         onPointerMove={onPointerMove}
@@ -53,6 +65,7 @@ export function Knob({ label, value, min, max, step = 0.1, unit = '', onChange }
         aria-valuemin={min}
         aria-valuemax={max}
         aria-valuenow={value}
+        aria-disabled={disabled}
       >
         <div className="knobDial" style={{ transform: `rotate(${angle}deg)` }} />
       </div>

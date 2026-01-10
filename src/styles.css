@@ -79,6 +79,10 @@ body {
   position: relative;
   cursor: ns-resize;
 }
+.knobDisabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
 .knobDial {
   position:absolute;
   top: 10px; left: 50%;
